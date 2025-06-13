@@ -1,0 +1,31 @@
+# DappLooker Enhanced Fetcher - Environment Configuration
+# ⚠️  SECURITY: Keep this file secure and never share your private key
+
+# === WALLET CONFIGURATION ===
+# Your Ethereum wallet private key (64 hex characters)
+WALLET_PRIVATE_KEY=your_private_key_here
+
+# Your wallet address (0x...)
+WALLET_ADDRESS=your_wallet_address_here
+
+# === IRYS CONFIGURATION ===
+# Irys node URL
+IRYS_NODE=https://uploader.irys.xyz
+
+# Token type for payments
+IRYS_TOKEN=ethereum
+
+# Currency for display
+IRYS_CURRENCY=ETH
+
+# === AUTOMATION SETTINGS ===
+# Enable/disable automatic daily scheduling (true/false)
+AUTO_SCHEDULE=false
+
+# Enable/disable Irys uploads (true/false)
+UPLOAD_ENABLED=true
+
+# Security Note:
+# - Keep your private key secure and never share it
+# - The .env file should be added to .gitignore  
+# - Your wallet needs ETH balance for Irys upload fees 

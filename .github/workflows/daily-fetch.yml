@@ -1,0 +1,64 @@
+name: Daily DappLooker Fetch
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  fetch-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+          
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Set up Node.js for Irys CLI
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        
+    - name: Install Irys CLI
+      run: |
+        npm install -g @irys/cli
+        
+    - name: Verify Irys CLI installation
+      run: |
+        irys --version
+        
+    - name: Run DappLooker Script
+      env:
+        WALLET_PRIVATE_KEY: ${{ secrets.WALLET_PRIVATE_KEY }}
+        IRYS_TOKEN: ethereum
+        IRYS_NODE: https://uploader.irys.xyz
+        UPLOAD_ENABLED: true
+      run: |
+        echo "🚀 Starting DappLooker daily fetch..."
+        python enhanced_dapplooker.py
+        echo "✅ DappLooker fetch completed!"
+        
+    - name: Upload logs as artifact (on failure)
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: error-logs
+        path: enhanced_dapplooker.log
+        retention-days: 7 

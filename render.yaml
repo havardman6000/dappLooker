@@ -1,0 +1,16 @@
+services:
+  - type: cron
+    name: dapplooker-daily-fetcher
+    env: python
+    schedule: "0 6 * * *"  # Run daily at 6:00 AM UTC
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python enhanced_dapplooker.py"
+    envVars:
+      - key: IRYS_TOKEN
+        value: ethereum
+      - key: IRYS_NODE
+        value: https://uploader.irys.xyz
+      - key: WALLET_PRIVATE_KEY
+        fromSecret: WALLET_PRIVATE_KEY  # Set this in Render dashboard
+      - key: UPLOAD_ENABLED
+        value: "true" 
