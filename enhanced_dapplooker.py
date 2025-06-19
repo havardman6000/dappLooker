@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configuration
-API_KEY = "e3541b9c746540028b6be3fd4cd3a3b5"
+API_KEY = "0de6af685d0d40e2852ead2d67210442"
 METAINFO_URL = "https://api.dapplooker.com/v1/crypto-metainfo"
 MARKET_URL = "https://api.dapplooker.com/v1/crypto-market/"
 
@@ -56,7 +56,7 @@ def cleanup_old_files():
     removed_count = 0
     
     # Clean up CSV files
-    for pattern in ['market_data_*.csv', 'simple_market_data_*.csv']:
+    for pattern in ['market_data_*.csv', 'missing_tokens_*.csv', 'simple_market_data_*.csv']:
         for file_path in glob.glob(pattern):
             try:
                 file_time = datetime.fromtimestamp(os.path.getmtime(file_path))
@@ -137,6 +137,35 @@ def initialize_csv(filename):
     logger.info(f"✅ {filename} created with {len(fieldnames)} columns")
     return fieldnames
 
+def initialize_missing_tokens_csv(filename):
+    """Create CSV file for tokens missing market data"""
+    fieldnames = ['symbol', 'chain', 'timestamp', 'reason']
+    
+    with open(filename, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+    
+    logger.info(f"✅ {filename} created for tracking missing market data")
+    return fieldnames
+
+def log_missing_tokens(token_symbols, chain, filename, reason):
+    """Log tokens that don't have market data to separate CSV"""
+    if not token_symbols:
+        return
+    
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    with open(filename, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['symbol', 'chain', 'timestamp', 'reason'])
+        
+        for symbol in token_symbols:
+            writer.writerow({
+                'symbol': symbol,
+                'chain': chain,
+                'timestamp': timestamp,
+                'reason': reason
+            })
+
 def get_all_tokens(chain):
     """
     Step 1: Get all tokens using crypto-metainfo API
@@ -199,70 +228,254 @@ def get_all_tokens(chain):
     logger.info(f"✅ STEP 1 Complete: Found {total_tokens} tokens")
     return tokens
 
-def get_market_data(chain, token_symbols, fieldnames, filename, existing_ids):
-    """
-    Step 2: Get market data using crypto-market API with token_tickers parameter
-    Process in batches of 30 tokens at a time
-    """
-    total_processed = 0
-    batch_size = 30
+def classify_tokens(token_symbols):
+    """Classify tokens as clean or problematic based on special characters"""
+    clean_tokens = []
+    problematic_tokens = []
     
-    for i in range(0, len(token_symbols), batch_size):
-        batch = token_symbols[i:i+batch_size]
-        token_tickers = ','.join(batch)
-        
-        params = {
-            'api_key': API_KEY,
-            'chain': chain,
-            'token_tickers': token_tickers
-        }
-        
+    for token in token_symbols:
+        # Check for problematic characters that cause URL encoding issues
+        if any(char in token for char in ['$', ',', '&', '=', '?', '#', '%', '+', ' ']):
+            problematic_tokens.append(token)
+        else:
+            clean_tokens.append(token)
+    
+    return clean_tokens, problematic_tokens
+
+def try_batch_request(chain, batch, batch_type=""):
+    """Try to process a batch of tokens with 502 error retry logic"""
+    token_tickers = ','.join(batch)
+    
+    params = {
+        'api_key': API_KEY,
+        'chain': chain,
+        'token_tickers': token_tickers
+    }
+    
+    # Retry logic for 502 errors
+    max_retries = 3
+    retry_delays = [2, 5, 10]  # Progressive delays in seconds
+    
+    for attempt in range(max_retries):
         try:
             response = requests.get(MARKET_URL, params=params, timeout=60)
             response.raise_for_status()
             
             try:
                 data = response.json()
-                # Handle the correct API response format: {"success": true, "data": [...]}
                 if not data.get('success'):
-                    logger.error(f"❌ API returned success=false: {data}")
-                    continue
+                    logger.warning(f"⚠️ {batch_type}Batch API returned success=false: {data}")
+                    return False, None, f"API success=false: {data}"
                     
                 market_data = data.get('data', [])
+                return True, market_data, None
+                
             except ValueError as e:
-                logger.error(f"❌ Invalid JSON response: {str(e)}")
-                continue
+                logger.warning(f"⚠️ {batch_type}Batch JSON error: {str(e)}")
+                return False, None, f"JSON parsing error: {str(e)}"
             
-            # Write to CSV
-            records_added = write_market_data(market_data, fieldnames, filename, existing_ids)
-            total_processed += records_added
-            
-            logger.info(f"   ✅ Batch {i//batch_size + 1}: Processed {len(batch)} tokens, added {records_added} records")
-            time.sleep(0.2)  # Rate limiting
-            
+        except requests.exceptions.HTTPError as e:
+            if hasattr(e.response, 'status_code') and e.response.status_code == 502:
+                if attempt < max_retries - 1:  # Don't retry on last attempt
+                    delay = retry_delays[attempt]
+                    logger.warning(f"⚠️ {batch_type}502 Server Error (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.warning(f"⚠️ {batch_type}502 Server Error - max retries exceeded")
+                    return False, None, f"Request error: {str(e)}"
+            else:
+                logger.warning(f"⚠️ {batch_type}HTTP error: {str(e)}")
+                return False, None, f"Request error: {str(e)}"
         except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Error fetching market data for batch {i//batch_size + 1}: {str(e)}")
+            logger.warning(f"⚠️ {batch_type}Batch request error: {str(e)}")
+            return False, None, f"Request error: {str(e)}"
         except Exception as e:
-            logger.error(f"❌ Unexpected error processing batch {i//batch_size + 1}: {str(e)}")
+            logger.warning(f"⚠️ {batch_type}Batch unexpected error: {str(e)}")
+            return False, None, f"Unexpected error: {str(e)}"
+    
+    return False, None, "Max retries exceeded"
+
+def try_individual_requests(chain, tokens, missing_tokens_filename):
+    """Process tokens individually as fallback, only log failures to CSV"""
+    individual_data = []
+    individual_processed = 0
+    
+    logger.info(f"   🔄 Falling back to individual requests for {len(tokens)} tokens...")
+    
+    for token in tokens:
+        params = {
+            'api_key': API_KEY,
+            'chain': chain,
+            'token_tickers': token
+        }
+        
+        # Retry logic for individual requests too
+        max_retries = 2
+        retry_delays = [1, 3]
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(MARKET_URL, params=params, timeout=30)
+                response.raise_for_status()
+                
+                try:
+                    data = response.json()
+                    if data.get('success'):
+                        token_data = data.get('data', [])
+                        if token_data:
+                            individual_data.extend(token_data)
+                            individual_processed += 1
+                        else:
+                            # No market data returned - not an error, just no data
+                            log_missing_tokens([token], chain, missing_tokens_filename, "No market data returned")
+                    else:
+                        # API returned success=false - log as error
+                        log_missing_tokens([token], chain, missing_tokens_filename, f"API error - success=false")
+                    break  # Success, exit retry loop
+                except ValueError as e:
+                    # JSON parsing error - log as error
+                    log_missing_tokens([token], chain, missing_tokens_filename, f"JSON parsing error: {str(e)}")
+                    break  # No point retrying JSON errors
+                    
+            except requests.exceptions.HTTPError as e:
+                if hasattr(e.response, 'status_code') and e.response.status_code == 502:
+                    if attempt < max_retries - 1:  # Don't retry on last attempt
+                        delay = retry_delays[attempt]
+                        time.sleep(delay)
+                        continue
+                    else:
+                        # Max retries exceeded for 502
+                        log_missing_tokens([token], chain, missing_tokens_filename, f"Request error: {str(e)}")
+                        break
+                else:
+                    # Other HTTP errors - log and exit
+                    log_missing_tokens([token], chain, missing_tokens_filename, f"Request error: {str(e)}")
+                    break
+            except requests.exceptions.RequestException as e:
+                # Other request errors - log and exit
+                log_missing_tokens([token], chain, missing_tokens_filename, f"Request error: {str(e)}")
+                break
+            except Exception as e:
+                # Unexpected error - log and exit
+                log_missing_tokens([token], chain, missing_tokens_filename, f"Unexpected error: {str(e)}")
+                break
+        
+        time.sleep(0.1)  # Small delay between individual requests
+    
+    return individual_data, individual_processed
+
+def get_market_data(chain, token_symbols, fieldnames, filename, existing_ids, missing_tokens_filename):
+    """
+    Step 2: Get market data using crypto-market API with smart batching
+    - Use normal batches for clean tokens
+    - Use smaller batches for problematic tokens
+    - Fall back to individual requests when batches fail
+    - Only log to CSV after individual fallback fails
+    """
+    total_processed = 0
+    
+    # Classify tokens
+    clean_tokens, problematic_tokens = classify_tokens(token_symbols)
+    
+    logger.info(f"   📊 Token classification: {len(clean_tokens)} clean, {len(problematic_tokens)} problematic")
+    
+    # Process clean tokens in normal batches (30 tokens)
+    if clean_tokens:
+        logger.info(f"   🔄 Processing {len(clean_tokens)} clean tokens in normal batches...")
+        batch_size = 30
+        
+        for i in range(0, len(clean_tokens), batch_size):
+            batch = clean_tokens[i:i+batch_size]
+            batch_num = i//batch_size + 1
+            
+            success, market_data, error = try_batch_request(chain, batch, f"Clean batch {batch_num}: ")
+            
+            if success:
+                # Track which tokens got market data
+                tokens_with_data = set()
+                for record in market_data:
+                    token_info = record.get('token_info', {})
+                    symbol = token_info.get('symbol', '').lower()
+                    if symbol:
+                        tokens_with_data.add(symbol)
+                
+                # Find tokens without market data
+                tokens_without_data = [token for token in batch if token not in tokens_with_data]
+                if tokens_without_data:
+                    log_missing_tokens(tokens_without_data, chain, missing_tokens_filename, "No market data returned")
+                
+                # Write to CSV
+                records_added = write_market_data(market_data, fieldnames, filename, existing_ids)
+                total_processed += records_added
+                
+                missing_count = len(tokens_without_data)
+                logger.info(f"   ✅ Clean batch {batch_num}: Processed {len(batch)} tokens, added {records_added} records, {missing_count} missing")
+            else:
+                # Batch failed, fall back to individual requests
+                logger.info(f"   ⚠️ Clean batch {batch_num} failed, falling back to individual requests")
+                individual_data, individual_count = try_individual_requests(chain, batch, missing_tokens_filename)
+                
+                if individual_data:
+                    records_added = write_market_data(individual_data, fieldnames, filename, existing_ids)
+                    total_processed += records_added
+                    logger.info(f"   ✅ Individual fallback: Added {records_added} records from {individual_count} tokens")
+            
+            time.sleep(0.2)  # Rate limiting
+    
+    # Process problematic tokens in smaller batches (10 tokens)
+    if problematic_tokens:
+        logger.info(f"   🔄 Processing {len(problematic_tokens)} problematic tokens in smaller batches...")
+        batch_size = 10
+        
+        for i in range(0, len(problematic_tokens), batch_size):
+            batch = problematic_tokens[i:i+batch_size]
+            batch_num = i//batch_size + 1
+            
+            success, market_data, error = try_batch_request(chain, batch, f"Problematic batch {batch_num}: ")
+            
+            if success:
+                # Track which tokens got market data
+                tokens_with_data = set()
+                for record in market_data:
+                    token_info = record.get('token_info', {})
+                    symbol = token_info.get('symbol', '').lower()
+                    if symbol:
+                        tokens_with_data.add(symbol)
+                
+                # Find tokens without market data
+                tokens_without_data = [token for token in batch if token not in tokens_with_data]
+                if tokens_without_data:
+                    log_missing_tokens(tokens_without_data, chain, missing_tokens_filename, "No market data returned")
+                
+                # Write to CSV
+                records_added = write_market_data(market_data, fieldnames, filename, existing_ids)
+                total_processed += records_added
+                
+                missing_count = len(tokens_without_data)
+                logger.info(f"   ✅ Problematic batch {batch_num}: Processed {len(batch)} tokens, added {records_added} records, {missing_count} missing")
+            else:
+                # Batch failed, fall back to individual requests
+                logger.info(f"   ⚠️ Problematic batch {batch_num} failed, falling back to individual requests")
+                individual_data, individual_count = try_individual_requests(chain, batch, missing_tokens_filename)
+                
+                if individual_data:
+                    records_added = write_market_data(individual_data, fieldnames, filename, existing_ids)
+                    total_processed += records_added
+                    logger.info(f"   ✅ Individual fallback: Added {records_added} records from {individual_count} tokens")
+            
+            time.sleep(0.2)  # Rate limiting
     
     return total_processed
 
 def write_market_data(market_data, fieldnames, filename, existing_ids):
-    """Write market data to CSV file, preventing duplicates"""
+    """Write market data to CSV file"""
     records_added = 0
-    skipped = 0
     
     with open(filename, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         
         for record in market_data:
-            # Extract base data
-            token_id = record.get('id')
-            
-            if token_id in existing_ids:
-                skipped += 1
-                continue
-                
             # Flatten nested data
             flat_record = {}
             
@@ -306,12 +519,11 @@ def write_market_data(market_data, fieldnames, filename, existing_ids):
             
             # Write record
             writer.writerow(flat_record)
-            existing_ids.add(token_id)
             records_added += 1
     
-    if records_added > 0 or skipped > 0:
+    if records_added > 0:
         file_size = os.path.getsize(filename)
-        logger.info(f"   ✅ Added {records_added} records, skipped {skipped} duplicates (Size: {file_size:,} bytes)")
+        logger.info(f"   ✅ Added {records_added} records (Size: {file_size:,} bytes)")
     
     return records_added
 
@@ -357,18 +569,66 @@ def upload_to_irys(csv_file_path):
         if result.returncode == 0:
             output = result.stdout.strip()
             
-            # Extract transaction ID
+            # Enhanced transaction ID extraction with multiple patterns
+            tx_id = None
+            
+            # Log the raw output for debugging
+            logger.info(f"📄 Raw Irys output ({len(output)} chars):")
+            for i, line in enumerate(output.split('\n')):
+                logger.info(f"   Line {i}: '{line}'")
+            
+            # Pattern 1: Standard format
             for line in output.split('\n'):
                 if line.startswith('Uploaded to https://gateway.irys.xyz/'):
-                    tx_id = line.split('/')[-1]
-                    logger.info("🎊 UPLOAD SUCCESSFUL!")
-                    logger.info(f"   🆔 Transaction ID: {tx_id}")
-                    logger.info(f"   🔗 Gateway: https://gateway.irys.xyz/{tx_id}")
-                    logger.info(f"   🔍 Explorer: https://explorer.irys.xyz/tx/{tx_id}")
-                    return tx_id
+                    tx_id = line.split('/')[-1].strip()
+                    logger.info(f"✅ TX ID extracted (Pattern 1): {tx_id}")
+                    break
             
-            logger.info("✅ Upload completed")
-            return "success"
+            # Pattern 2: Any line containing gateway.irys.xyz
+            if not tx_id:
+                for line in output.split('\n'):
+                    if 'gateway.irys.xyz' in line and '/' in line:
+                        tx_id = line.split('/')[-1].strip()
+                        logger.info(f"✅ TX ID extracted (Pattern 2): {tx_id}")
+                        break
+            
+            # Pattern 3: Look for long alphanumeric strings (likely TX IDs)
+            if not tx_id:
+                for line in output.split('\n'):
+                    words = line.split()
+                    for word in words:
+                        # Irys TX IDs are typically 44+ characters, base58 encoded
+                        if len(word) >= 40 and word.replace('-', '').replace('_', '').isalnum():
+                            # Exclude wallet addresses (start with 0x)
+                            if not word.startswith('0x'):
+                                tx_id = word
+                                logger.info(f"✅ TX ID extracted (Pattern 3): {tx_id}")
+                                break
+                    if tx_id:
+                        break
+            
+            if tx_id:
+                logger.info("🎊 UPLOAD SUCCESSFUL!")
+                logger.info("=" * 60)
+                logger.info(f"📦 FILE: {os.path.basename(csv_file_path)}")
+                logger.info(f"🆔 TRANSACTION ID: {tx_id}")
+                logger.info(f"🔗 ACCESS LINK: https://gateway.irys.xyz/{tx_id}")
+                logger.info(f"🔍 EXPLORER LINK: https://explorer.irys.xyz/tx/{tx_id}")
+                logger.info("=" * 60)
+                logger.info("💡 Use the ACCESS LINK above to download/view your file")
+                
+                # Verify the link works by testing the format
+                if len(tx_id) >= 40 and tx_id.replace('-', '').replace('_', '').isalnum():
+                    logger.info("✅ Transaction ID format appears valid")
+                else:
+                    logger.warning(f"⚠️ Transaction ID format may be invalid: {tx_id}")
+                
+                return tx_id
+            else:
+                logger.warning("⚠️ Upload completed but transaction ID not found in output")
+                logger.info(f"📤 Full stdout: {output}")
+                logger.info(f"📤 Full stderr: {result.stderr}")
+                return "success"
         else:
             logger.error(f"❌ Upload failed: {result.stderr}")
             return None
@@ -377,7 +637,7 @@ def upload_to_irys(csv_file_path):
         logger.error(f"❌ Upload error: {e}")
         return None
 
-def process_chain(chain, fieldnames, filename, existing_ids):
+def process_chain(chain, fieldnames, filename, existing_ids, missing_tokens_filename):
     """Process all tokens for a chain"""
     logger.info(f"\n🔄 PROCESSING: {chain.upper()}")
     logger.info("-" * 60)
@@ -392,7 +652,7 @@ def process_chain(chain, fieldnames, filename, existing_ids):
     
     # Step 2: Get market data for tokens
     logger.info(f"\n📊 STEP 2: Getting market data for {len(tokens)} tokens")
-    total_processed = get_market_data(chain, tokens, fieldnames, filename, existing_ids)
+    total_processed = get_market_data(chain, tokens, fieldnames, filename, existing_ids, missing_tokens_filename)
     
     return total_processed
 
@@ -414,30 +674,59 @@ def main():
     filename = f"market_data_{timestamp}.csv"
     fieldnames = initialize_csv(filename)
     
+    # Create missing tokens CSV file
+    missing_tokens_filename = f"missing_tokens_{timestamp}.csv"
+    initialize_missing_tokens_csv(missing_tokens_filename)
+    
     # Track existing IDs for duplicate prevention
     existing_ids = set()
     total_records = 0
     
     # Process Base chain
-    total_records += process_chain("base", fieldnames, filename, existing_ids)
+    total_records += process_chain("base", fieldnames, filename, existing_ids, missing_tokens_filename)
     
     # Process Solana chain
-    total_records += process_chain("solana", fieldnames, filename, existing_ids)
+    total_records += process_chain("solana", fieldnames, filename, existing_ids, missing_tokens_filename)
     
     # Upload to Irys
     logger.info("\n📤 UPLOADING TO IRYS")
     logger.info("-" * 50)
     tx_id = upload_to_irys(filename)
     
-    if tx_id:
-        logger.info("✅ COMPLETE SUCCESS!")
-        logger.info(f"🆔 TRANSACTION ID: {tx_id}")
-        logger.info("🔄 Daily refresh ready - run again tomorrow for updates")
-    else:
-        logger.info("✅ Data collection successful (upload skipped)")
+     # Final summary
+    end_time = datetime.now()
+    duration = end_time - start_time
     
+    # Check if missing tokens file has content
+    missing_tokens_count = 0
+    if os.path.exists(missing_tokens_filename):
+        with open(missing_tokens_filename, 'r') as f:
+            missing_tokens_count = sum(1 for line in f) - 1  # Subtract header
+    
+    logger.info("\n🎯 FINAL RESULTS")
+    logger.info("=" * 70)
+    logger.info(f"📊 Total Records Collected: {total_records:,}")
+    logger.info(f"📁 Market Data File: {filename}")
+    logger.info(f"🔍 Missing Tokens File: {missing_tokens_filename}")
+    logger.info(f"❌ Tokens Without Market Data: {missing_tokens_count:,}")
+    logger.info(f"⏱️  Duration: {duration}")
+    
+    if tx_id and tx_id != "success":
+        logger.info("🎊 IRYS UPLOAD SUCCESSFUL!")
+        logger.info(f"🆔 TRANSACTION ID: {tx_id}")
+        logger.info(f"🔗 ACCESS YOUR FILE: https://gateway.irys.xyz/{tx_id}")
+        logger.info(f"🔍 VIEW ON EXPLORER: https://explorer.irys.xyz/tx/{tx_id}")
+        logger.info("💡 Copy the ACCESS link to download your file anytime!")
+    elif tx_id == "success":
+        logger.info("✅ Upload completed successfully")
+    else:
+        logger.info("⚠️  Upload failed or skipped")
+    
+    logger.info("=" * 70)
     logger.info(f"📝 Log saved to: enhanced_dapplooker.log")
+    logger.info(f"🔍 Missing tokens tracked in: {missing_tokens_filename}")
     logger.info(f"🧹 Files older than {RETENTION_DAYS} days automatically cleaned")
+    logger.info("🔄 Daily refresh ready - run again tomorrow for updates")
     
     return 0
 
